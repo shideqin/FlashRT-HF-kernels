@@ -7,6 +7,40 @@ import torch
 from ._ops import add_op_namespace_prefix, ops
 
 
+NVFP4_BLOCK_SIZE = 16
+NVFP4_SCALE_TILE_ROWS = 128
+NVFP4_SCALE_TILE_BLOCKS = 4
+SUPPORTED_LAYOUTS = ("row-major-packed-e2m1", "cutlass-sm1xx-blockscaled")
+SUPPORTED_CUDA_CAPABILITIES = ("11.0a", "12.0a")
+
+
+def capabilities() -> dict[str, object]:
+    """Return the public Tensor API contract used by runtime dispatchers."""
+    return {
+        "quantization": "W4A4 NVFP4 E2M1",
+        "block_size": NVFP4_BLOCK_SIZE,
+        "scale_layout": "pad128(rows) x pad4(dim/16), 512 bytes per tile",
+        "scale_size": "ceil(rows/128) * ceil((dim/16)/4) * 512 bytes",
+        "layouts": SUPPORTED_LAYOUTS,
+        "cuda_capabilities": SUPPORTED_CUDA_CAPABILITIES,
+        "public_m_alignment": 1,
+        "raw_sm120_tile_m": 128,
+        "sm120_m256_min_m": 512,
+        "sm120_m256_qualified_nk": (
+            (17408, 5120),
+            (5120, 17408),
+            (12288, 5120),
+        ),
+        "sm120_m256_diagnostic_nk": ((16384, 5120),),
+        "sm120_interleaved_gemv_m": 1,
+        "sm120_interleaved_weight_layout": "groups-of-8 x K/64 x 8 x 32B",
+        "sm120_warpsplit_mrows": (1, 16),
+        "sm120_warpsplit_mrows_n_alignment": 8,
+        "sm120_warpsplit_mrows_k_alignment": "64 * warps",
+        "errors": "exceptions",
+    }
+
+
 def sfa_size_bytes(rows: int, dim: int) -> int:
     if rows <= 0 or dim <= 0 or dim % 16 != 0:
         raise ValueError("rows must be positive and dim must be positive/divisible by 16")
@@ -67,12 +101,61 @@ def _bias_residual_fp16_fake(a, b, sfa, sfb, bias, residual, out) -> None:
     return None
 
 
+@torch.library.register_fake(add_op_namespace_prefix("fp4_w4a4_gemm_warpsplit_mrows_bf16"))
+def _gemm_warpsplit_mrows_fake(a_packed, b_packed, sfa, sfb, out, alpha: float = 1.0, warps: int = 2, stages: int = 6) -> None:
+    if a_packed.dim() != 2 or b_packed.dim() != 2:
+        raise RuntimeError("a_packed and b_packed must be rank-2")
+    if a_packed.shape[1] != b_packed.shape[1]:
+        raise RuntimeError("a_packed and b_packed must have the same K / 2")
+    if not 1 <= a_packed.shape[0] <= 16:
+        raise RuntimeError("the multi-row warp-split tier serves 1..16 rows")
+    if b_packed.shape[0] % 8:
+        raise RuntimeError("N must be a multiple of 8")
+    if warps not in (2, 4, 8):
+        raise RuntimeError("warps must be 2, 4 or 8")
+    if stages not in (3, 4, 6) or (warps == 8 and stages == 6):
+        raise RuntimeError("unsupported stages/warps combination")
+    if (a_packed.shape[1] * 2) % (64 * warps):
+        raise RuntimeError("K must be a multiple of 64*warps")
+    if out.shape != (a_packed.shape[0], b_packed.shape[0]):
+        raise RuntimeError("out must have shape (M, N)")
+    return None
+
+
 @torch.library.register_fake(add_op_namespace_prefix("fp4_w4a4_gemv_warpsplit_bf16"))
 def _gemv_warpsplit_fake(a_packed, b_packed, sfa, sfb, out, alpha: float = 1.0, warps: int = 4, stages: int = 4) -> None:
     if a_packed.shape[0] != 1:
         raise RuntimeError("warp-split GEMV serves M=1 only")
     if out.shape != (1, b_packed.shape[0]):
         raise RuntimeError("out must have shape (1, N)")
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp4_repack_b_interleaved_sm120"))
+def _repack_b_interleaved_fake(b_packed, b_interleaved) -> None:
+    if b_interleaved.shape != b_packed.shape:
+        raise RuntimeError("b_interleaved must have the same shape as b_packed")
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp4_w4a4_gemv_warpsplit_interleaved_bf16"))
+def _gemv_warpsplit_interleaved_fake(
+    a_packed, b_interleaved, sfa, sfb, out,
+    alpha: float = 1.0, warps: int = 4, stages: int = 4,
+) -> None:
+    if a_packed.shape[0] != 1:
+        raise RuntimeError("interleaved warp-split GEMV serves M=1 only")
+    if out.shape != (1, b_interleaved.shape[0]):
+        raise RuntimeError("out must have shape (1, N)")
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("nvfp4_gemm_m256_bf16"))
+def _m256_fake(a_packed, b_packed, sfa, sfb, workspace, out, alpha: float = 1.0) -> None:
+    if a_packed.shape[0] < 512:
+        raise RuntimeError("the M256 tier requires M >= 512")
+    if out.shape != (a_packed.shape[0], b_packed.shape[0]):
+        raise RuntimeError("out must have shape (M, N)")
     return None
 
 
@@ -535,6 +618,31 @@ def nvfp4_gemm_bias_residual_fp16(
     return out
 
 
+def fp4_w4a4_gemm_warpsplit_mrows_bf16(
+    a_packed: torch.Tensor,
+    b_packed: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    warps: int = 2,
+    stages: int = 6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Multi-row (M<=16) warp-split-K NVFP4 W4A4 GEMM (SM120).
+
+    The 16x8x64 block-scaled MMA atom computes a full 16-row output
+    tile, so up to sixteen rows ride one weight stream at near-GEMV
+    cost - the spec-verify block and its re-advance prefixes are the
+    customers. Same packed/scale layouts as the linear entry points;
+    deeper default stages hide the strided-B latency the extra A-row
+    loads expose."""
+    if out is None:
+        out = torch.empty((a_packed.shape[0], b_packed.shape[0]), device=a_packed.device, dtype=torch.bfloat16)
+    ops.fp4_w4a4_gemm_warpsplit_mrows_bf16(a_packed, b_packed, sfa, sfb, out, float(alpha), int(warps), int(stages))
+    return out
+
+
 def fp4_w4a4_gemv_warpsplit_bf16(
     a_packed: torch.Tensor,
     b_packed: torch.Tensor,
@@ -556,6 +664,89 @@ def fp4_w4a4_gemv_warpsplit_bf16(
     if out is None:
         out = torch.empty((1, b_packed.shape[0]), device=a_packed.device, dtype=torch.bfloat16)
     ops.fp4_w4a4_gemv_warpsplit_bf16(a_packed, b_packed, sfa, sfb, out, float(alpha), int(warps), int(stages))
+    return out
+
+
+def fp4_repack_b_interleaved_sm120(
+    b_packed: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Repack dense row-major packed FP4 weights for the SM120 M=1 GEMV.
+
+    This is a bind-time operation. Cache the returned tensor with the packed
+    weight; do not execute it in the decode hot path.
+    """
+    if out is None:
+        out = torch.empty_like(b_packed)
+    ops.fp4_repack_b_interleaved_sm120(b_packed, out)
+    return out
+
+
+def fp4_w4a4_gemv_warpsplit_interleaved_bf16(
+    a_packed: torch.Tensor,
+    b_interleaved: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    warps: int = 8,
+    stages: int = 3,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """M=1 SM120 W4A4 GEMV using bind-time interleaved FP4 weights."""
+    if out is None:
+        out = torch.empty(
+            (1, b_interleaved.shape[0]),
+            device=a_packed.device,
+            dtype=torch.bfloat16,
+        )
+    ops.fp4_w4a4_gemv_warpsplit_interleaved_bf16(
+        a_packed, b_interleaved, sfa, sfb, out,
+        float(alpha), int(warps), int(stages),
+    )
+    return out
+
+
+def nvfp4_gemm_m256_workspace_size(
+    a_packed: torch.Tensor,
+    b_packed: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+) -> int:
+    """Return workspace bytes for the SM120 large-M tier.
+
+    Query and allocate once before CUDA Graph capture.
+    """
+    return int(ops.nvfp4_gemm_m256_workspace_size(a_packed, b_packed, sfa, sfb))
+
+
+def nvfp4_gemm_m256_bf16(
+    a_packed: torch.Tensor,
+    b_packed: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    *,
+    workspace: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """SM120 M>=512 NVFP4 GEMM with a caller-owned graph-stable workspace."""
+    if workspace is None:
+        workspace = torch.empty(
+            nvfp4_gemm_m256_workspace_size(a_packed, b_packed, sfa, sfb),
+            device=a_packed.device,
+            dtype=torch.uint8,
+        )
+    if out is None:
+        out = torch.empty(
+            (a_packed.shape[0], b_packed.shape[0]),
+            device=a_packed.device,
+            dtype=torch.bfloat16,
+        )
+    ops.nvfp4_gemm_m256_bf16(
+        a_packed, b_packed, sfa, sfb, workspace, out, float(alpha)
+    )
     return out
 
 
@@ -714,16 +905,27 @@ def nvfp4_gemm_streamk_bias_bf16(
 
 
 __all__ = [
+    "NVFP4_BLOCK_SIZE",
+    "NVFP4_SCALE_TILE_ROWS",
+    "NVFP4_SCALE_TILE_BLOCKS",
+    "SUPPORTED_CUDA_CAPABILITIES",
+    "SUPPORTED_LAYOUTS",
+    "capabilities",
     "aligned_fp4_dim",
     "cutlass_fp4_gemm_geglu_il_hw_v10",
     "dequantize_fp4_sfa_fp16",
     "e0m3_weight_gemm_fp16",
     "fp4_w4a16_linear_bf16",
+    "fp4_repack_b_interleaved_sm120",
     "fp4_w4a4_gemv_warpsplit_bf16",
+    "fp4_w4a4_gemv_warpsplit_interleaved_bf16",
+    "fp4_w4a4_gemm_warpsplit_mrows_bf16",
     "nvfp4_gemm_bf16",
     "nvfp4_gemm_fp16",
     "nvfp4_gemm_variant_bf16",
     "nvfp4_gemm_nvfp4",
+    "nvfp4_gemm_m256_bf16",
+    "nvfp4_gemm_m256_workspace_size",
     "nvfp4_gemm_geglu_nvfp4_fp16",
     "nvfp4_gemm_bias_gelu_nvfp4_fp16",
     "nvfp4_gemm_bias_residual_fp16",

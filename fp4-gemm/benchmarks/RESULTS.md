@@ -1,5 +1,21 @@
 # fp4-gemm Benchmark Results
 
+## SM120 Qwen3.8 Decode/Prefill Tiers
+
+Source-extension validation on RTX 5090, PyTorch `2.11.0+cu128`, CUTLASS
+4.5.0. The interleaved GEMV bandwidth row cycles a `574.6 MiB` working set.
+
+| Workload | Shape | Baseline | New tier | Speedup / bandwidth |
+| --- | --- | ---: | ---: | ---: |
+| interleaved GEMV | M1 N17408 K5120 | 35.99 us | 32.82 us | 1.096x / 1529.8 GB/s |
+| M256 GEMM | M2044 N17408 K5120 | 0.275 ms | 0.251 ms | 1.097x |
+| M256 GEMM | M2044 N5120 K17408 | 0.268 ms | 0.230 ms | 1.167x |
+| M256 GEMM | M2044 N12288 K5120 | 0.196 ms | 0.179 ms | 1.099x |
+| M256 diagnostic | M2044 N16384 K5120 | 0.262 ms | 0.266 ms | 0.986x; rejected from production qualification |
+
+Correctness is reported in `VALIDATION.md`; performance rows are never used as
+a substitute for the bit-exact and graph-replay gates.
+
 ## SM120 public bias dispatch (2026-08-11)
 
 Source release candidate on RTX 5090, PyTorch `2.11.0+cu128`. The public
@@ -161,3 +177,15 @@ replay, and unsupported-shape rejection. The BF16 MSE packer reduced
 reconstruction MSE from `0.000571271` to `0.000450529`. The RTX 5090 source
 regression passed `26/26`. Installed-artifact validation is required after the
 Hub build is published.
+
+## SM120 speculative-verify multi-row tier
+
+RTX 5090, PyTorch `2.11.0+cu128`, CUDA 12.8, 20 warmup and 100 measured
+iterations with preallocated outputs:
+
+| Shape | Multi-row GEMM | 8x warp-split GEMV | Speedup | Correctness |
+| --- | ---: | ---: | ---: | --- |
+| M=8, N=17408, K=5120 | 42.24 us | 234.86 us | 5.56x | bit-exact |
+
+The full gate covers six production N/K pairs and `M={2,4,7,8}`. All 24
+rows are bit-exact against independently quantized per-row GEMV references.

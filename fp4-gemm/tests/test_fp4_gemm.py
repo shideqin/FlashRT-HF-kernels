@@ -117,6 +117,26 @@ class SourceOps:
     def nvfp4_gemm_bf16(self, a, b, sfa, sfb, out, alpha=1.0, variant=0):
         self._ops.nvfp4_gemm_bf16(a, b, sfa, sfb, out, float(alpha), int(variant))
 
+    def repack_b_interleaved(self, b, out):
+        self._ops.fp4_repack_b_interleaved_sm120(b, out)
+
+    def gemv_interleaved(self, a, b, sfa, sfb, out, alpha=1.0, warps=4, stages=4):
+        self._ops.fp4_w4a4_gemv_warpsplit_interleaved_bf16(
+            a, b, sfa, sfb, out, float(alpha), int(warps), int(stages)
+        )
+
+    def gemm_warpsplit_mrows(self, a, b, sfa, sfb, out, alpha=1.0, warps=2, stages=6):
+        self._ops.fp4_w4a4_gemm_warpsplit_mrows_bf16(
+            a, b, sfa, sfb, out, float(alpha), int(warps), int(stages)
+        )
+
+    def m256(self, a, b, sfa, sfb, out, alpha=1.0):
+        size = self._ops.nvfp4_gemm_m256_workspace_size(a, b, sfa, sfb)
+        workspace = torch.empty(size, device=a.device, dtype=torch.uint8)
+        self._ops.nvfp4_gemm_m256_bf16(
+            a, b, sfa, sfb, workspace, out, float(alpha)
+        )
+
     def nvfp4_gemm_fp16(self, a, b, sfa, sfb, out, alpha=1.0, variant=-1):
         self._ops.nvfp4_gemm_fp16(
             a, b, sfa, sfb, out, float(alpha), int(variant)
@@ -210,6 +230,7 @@ class InstalledOps:
 
     def __init__(self, module) -> None:
         self._module = module
+        self._ops = module.ops
 
     def sfa_size_bytes(self, rows: int, dim: int) -> int:
         return int(self._module.sfa_size_bytes(rows, dim))
@@ -263,6 +284,44 @@ class InstalledOps:
             alpha=float(alpha),
             out=out,
             variant=int(variant),
+        )
+
+    def repack_b_interleaved(self, b, out):
+        self._module.fp4_repack_b_interleaved_sm120(b, out=out)
+
+    def gemv_interleaved(self, a, b, sfa, sfb, out, alpha=1.0, warps=4, stages=4):
+        self._module.fp4_w4a4_gemv_warpsplit_interleaved_bf16(
+            a,
+            b,
+            sfa,
+            sfb,
+            alpha=float(alpha),
+            warps=int(warps),
+            stages=int(stages),
+            out=out,
+        )
+
+    def gemm_warpsplit_mrows(self, a, b, sfa, sfb, out, alpha=1.0, warps=2, stages=6):
+        self._module.fp4_w4a4_gemm_warpsplit_mrows_bf16(
+            a, b, sfa, sfb, alpha=float(alpha), warps=int(warps),
+            stages=int(stages), out=out,
+        )
+
+    def m256(self, a, b, sfa, sfb, out, alpha=1.0):
+        workspace_size = self._module.nvfp4_gemm_m256_workspace_size(
+            a, b, sfa, sfb
+        )
+        workspace = torch.empty(
+            workspace_size, device=a.device, dtype=torch.uint8
+        )
+        self._module.nvfp4_gemm_m256_bf16(
+            a,
+            b,
+            sfa,
+            sfb,
+            workspace=workspace,
+            alpha=float(alpha),
+            out=out,
         )
 
     def nvfp4_gemm_fp16(self, a, b, sfa, sfb, out, alpha=1.0, variant=-1):
@@ -402,6 +461,9 @@ def load_source_ops() -> SourceOps:
         gemm_sources = [
             str(PACKAGE / "csrc" / "gemm" / "fp4" / "cutlass_nvfp4_w4a16_gemm_sm120.cu"),
             str(PACKAGE / "csrc" / "gemm" / "fp4" / "fp4_w4a4_mma_warpsplit_sm120.cu"),
+            str(PACKAGE / "csrc" / "gemm" / "fp4" / "fp4_w4a4_mma_warpsplit_ilv_sm120.cu"),
+            str(PACKAGE / "csrc" / "gemm" / "fp4" / "fp4_w4a4_mma_warpsplit_mrows_sm120.cu"),
+            str(PACKAGE / "csrc" / "gemm" / "fp4" / "cutlass_nvfp4_gemm_m256_sm120.cu"),
             str(PACKAGE / "csrc" / "gemm" / "fp4" / "cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu"),
             str(PACKAGE / "csrc" / "gemm" / "fp4" / "cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu"),
             str(PACKAGE / "csrc" / "gemm" / "fp4" / "cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu"),
@@ -653,6 +715,168 @@ def run_case(ops: SourceOps, name: str, shape: tuple[int, int, int]) -> list[Met
         )
 
     return results
+
+
+def run_sm120_qwen38_tier_gate(ops) -> dict[str, object]:
+    if torch.cuda.get_device_capability(0) != (12, 0):
+        return {"skipped": True, "reason": "requires SM120", "passed": True}
+
+    gemv_shapes = (
+        (17408, 5120), (5120, 17408), (12288, 5120),
+        (1024, 5120), (5120, 6144), (16384, 5120),
+    )
+    exact_rows = []
+    gen = torch.Generator(device="cuda").manual_seed(20260815)
+    for n, k in gemv_shapes:
+        a = torch.randint(0, 256, (1, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
+        b = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
+        sfa = torch.full((ops.sfa_size_bytes(1, k),), 0x38, device="cuda", dtype=torch.uint8)
+        sfb = torch.full((ops.sfa_size_bytes(n, k),), 0x38, device="cuda", dtype=torch.uint8)
+        b_interleaved = torch.empty_like(b)
+        ops.repack_b_interleaved(b, b_interleaved)
+        host_repack = b.view(n // 8, 8, k // 64, 32).permute(0, 2, 1, 3).contiguous().view_as(b)
+        repack_exact = torch.equal(b_interleaved, host_repack)
+        for warps in (2, 4, 8):
+            if (k // 64) % warps:
+                continue
+            base = torch.empty((1, n), device="cuda", dtype=torch.bfloat16)
+            got = torch.empty_like(base)
+            ops._ops.fp4_w4a4_gemv_warpsplit_bf16(
+                a, b, sfa, sfb, base, 1.0, warps, 3
+            )
+            ops.gemv_interleaved(
+                a, b_interleaved, sfa, sfb, got, warps=warps, stages=3
+            )
+            torch.cuda.synchronize()
+            exact_rows.append({
+                "N": n, "K": k, "warps": warps,
+                "repack_exact": repack_exact,
+                "output_exact": torch.equal(got, base),
+            })
+
+    m, n, k = 512, 1024, 1024
+    a, b, sfa, sfb, _ = prepare_quantized(ops, m, n, k)
+    base = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    got = torch.empty_like(base)
+    ops.nvfp4_gemm_bf16(a, b, sfa, sfb, base, variant=0)
+    ops.m256(a, b, sfa, sfb, got)
+    torch.cuda.synchronize()
+    m256_exact = torch.equal(got, base)
+
+    boundary_rejected = False
+    try:
+        a511 = torch.empty((511, k // 2), device="cuda", dtype=torch.uint8)
+        sfa511 = torch.empty(ops.sfa_size_bytes(511, k), device="cuda", dtype=torch.uint8)
+        ops._ops.nvfp4_gemm_m256_workspace_size(a511, b, sfa511, sfb)
+    except RuntimeError as error:
+        boundary_rejected = "M >= 512" in str(error)
+
+    workspace_size = ops._ops.nvfp4_gemm_m256_workspace_size(a, b, sfa, sfb)
+    workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops._ops.nvfp4_gemm_m256_bf16(a, b, sfa, sfb, workspace, got, 1.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    first = got.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_exact = torch.equal(first, got)
+
+    mrows_rows = []
+    for shape_index, (n, k) in enumerate(gemv_shapes):
+        warps, stages = ((4, 4) if n == 1024 else (2, 6))
+        b = torch.randint(
+            0, 256, (n, k // 2), device="cuda", dtype=torch.uint8,
+            generator=gen,
+        )
+        sfb = torch.full(
+            (ops.sfa_size_bytes(n, k),), 0x38,
+            device="cuda", dtype=torch.uint8,
+        )
+        for m in (2, 4, 7, 8):
+            x = (
+                torch.randn(
+                    (m, k), device="cuda", dtype=torch.float32,
+                    generator=gen,
+                ) * 0.25
+            ).bfloat16().contiguous()
+            a, sfa = ops.alloc_fp4(m, k)
+            ops.quantize_fp4_sfa_bf16(x, a, sfa)
+            got_rows = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            ops.gemm_warpsplit_mrows(
+                a, b, sfa, sfb, got_rows, warps=warps, stages=stages
+            )
+            bit_diffs = 0
+            for row in range(m):
+                ar, sr = ops.alloc_fp4(1, k)
+                ops.quantize_fp4_sfa_bf16(x[row : row + 1], ar, sr)
+                expected_row = torch.empty(
+                    (1, n), device="cuda", dtype=torch.bfloat16
+                )
+                ops._ops.fp4_w4a4_gemv_warpsplit_bf16(
+                    ar, b, sr, sfb, expected_row, 1.0, warps, stages
+                )
+                bit_diffs += int(
+                    (got_rows[row].view(torch.uint16)
+                     != expected_row[0].view(torch.uint16)).sum().item()
+                )
+            mrows_rows.append({
+                "shape_index": shape_index, "M": m, "N": n, "K": k,
+                "warps": warps, "stages": stages,
+                "bit_diffs_vs_per_row_gemv": bit_diffs,
+                "passed": bit_diffs == 0,
+            })
+
+    m, n, k = 8, 4096, 4096
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.randn((n, k), device="cuda", dtype=torch.float16)
+    a, sfa = ops.alloc_fp4(m, k)
+    b, sfb = ops.alloc_fp4(n, k)
+    ops.quantize_fp4_sfa_bf16(x, a, sfa)
+    ops.quantize_fp4_sfa_fp16(w, b, sfb, True)
+    mrows_out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    ops.gemm_warpsplit_mrows(a, b, sfa, sfb, mrows_out)
+    mrows_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(mrows_graph):
+        ops.gemm_warpsplit_mrows(a, b, sfa, sfb, mrows_out)
+    mrows_graph.replay()
+    torch.cuda.synchronize()
+    mrows_first = mrows_out.clone()
+    mrows_graph.replay()
+    torch.cuda.synchronize()
+    mrows_graph_exact = torch.equal(mrows_first, mrows_out)
+
+    m17 = torch.empty((17, k // 2), device="cuda", dtype=torch.uint8)
+    sfa17 = torch.empty(
+        ops.sfa_size_bytes(17, k), device="cuda", dtype=torch.uint8
+    )
+    m17_rejected = False
+    try:
+        ops.gemm_warpsplit_mrows(
+            m17, b, sfa17, sfb,
+            torch.empty((17, n), device="cuda", dtype=torch.bfloat16),
+        )
+    except RuntimeError as error:
+        m17_rejected = "1..16 rows" in str(error)
+    passed = (
+        len(exact_rows) == 18
+        and all(row["repack_exact"] and row["output_exact"] for row in exact_rows)
+        and len(mrows_rows) == 24
+        and all(row["passed"] for row in mrows_rows)
+        and mrows_graph_exact and m17_rejected
+        and m256_exact and boundary_rejected and graph_exact
+    )
+    return {
+        "gemv_rows": exact_rows,
+        "m256_vs_tile128_exact": m256_exact,
+        "m511_rejected": boundary_rejected,
+        "m256_graph_exact": graph_exact,
+        "mrows_rows": mrows_rows,
+        "mrows_graph_exact": mrows_graph_exact,
+        "mrows_m17_rejected": m17_rejected,
+        "passed": passed,
+    }
 
 
 def result_row(name, shape, workload, got, expected, *, fp4_output=False):
@@ -1293,6 +1517,11 @@ def main() -> int:
         ))
     sm110_additive_rows, sm110_additive_gate = run_sm110_e0m3_cosmos_cases(ops)
     results.extend(sm110_additive_rows)
+    sm120_qwen38_gate = (
+        run_sm120_qwen38_tier_gate(ops)
+        if args.mode == "full"
+        else {"skipped": True, "reason": "full mode only", "passed": True}
+    )
     compile_check = None
     padding_contract_check = None
     bf16_quantizer_check = check_bf16_quantizer(ops)
@@ -1313,6 +1542,8 @@ def main() -> int:
     passed += int(bool(bf16_quantizer_check["passed"]))
     total += 1
     passed += int(bool(sm110_additive_gate["passed"]))
+    total += 1
+    passed += int(bool(sm120_qwen38_gate["passed"]))
     payload = {
         "backend": args.backend,
         "mode": args.mode,
@@ -1325,6 +1556,7 @@ def main() -> int:
         "padding_contract_check": padding_contract_check,
         "bf16_quantizer_check": bf16_quantizer_check,
         "sm110_additive_gate": sm110_additive_gate,
+        "sm120_qwen38_gate": sm120_qwen38_gate,
     }
     print(json.dumps(payload, indent=2))
     if args.json_out:

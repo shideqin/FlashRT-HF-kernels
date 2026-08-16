@@ -30,6 +30,7 @@ The package supports two validated linear-attention producer profiles:
 - `gdn_gating_strided_h_bf16(a, b, neg_exp_A_log, dt_bias, rows, num_heads, a_stride, b_stride, ...)`
 - `gdn_chunk_from_conv_smem_bf16(conv_out, a, b, neg_exp_A_log, dt_bias, state, ...)`
 - `gdn_chunk_from_conv_smem_h_bf16(conv_out, a, b, neg_exp_A_log, dt_bias, state, num_v_heads, num_k_heads, ...)`
+- `gdn_chunk_from_conv_smem_stash_bf16(conv_out, a, b, neg_exp_A_log, dt_bias, state, stash, num_v_heads, num_k_heads, ...)`
 - `gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g, ...)`
 - `gdn_wy_kkt_b64_bf16(k16_l2, beta, g_cumsum, A=None)`
 - `gdn_wy_solve_tril_b64_f32(A, S, Ai=None)`
@@ -99,6 +100,12 @@ out = gdn.gdn_chunk_from_conv_smem_h_bf16(
     num_v_heads=Hv, num_k_heads=Hk,
 )
 
+stash = torch.empty(S, Hv, D, D, device="cuda", dtype=torch.bfloat16)
+out = gdn.gdn_chunk_from_conv_smem_stash_bf16(
+    conv_out, a, b, neg_exp_A_log, dt_bias, state, stash,
+    num_v_heads=Hv, num_k_heads=Hk,
+)
+
 # H32/H16 WY prefill uses the same native stages with model-neutral head args.
 q16 = conv_out[:, : Hk * D].view(S, Hk, D).contiguous()
 k16 = conv_out[:, Hk * D : 2 * Hk * D].view(S, Hk, D).contiguous()
@@ -131,6 +138,10 @@ The generic producer requires `Hv % Hk == 0` and currently supports
 state, and outputs are BF16. The fused chunk updates `state` in place and is
 CUDA Graph replay safe after normal warmup.
 
+The stash entry uses the same recurrence and BF16 carried-state rounding as
+the plain fused chunk. It requires contiguous `stash` storage shaped
+`(rows>=S,Hv,128,128)` and writes the state after each input row.
+
 Prefill-style WY pipeline:
 
 ```python
@@ -145,7 +156,7 @@ state = torch.zeros(48, 128, 128, device="cuda", dtype=torch.bfloat16)
 q16, k16, v48 = gdn.lin_split_qkv_gqa_bf16(conv_out)
 g, beta = gdn.gdn_gating_bf16(a, b, neg_exp_A_log, dt_bias)
 q16_l2, k16_l2, _, _, g_cumsum = gdn.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
-A = gdn.gdn_wy_kkt_b64_bf16(k16_l2, beta, g_cumsum)
+A = gdn.gdn_wy_kkt_b64_mma_bf16(k16_l2, beta, g_cumsum)
 Ai = gdn.gdn_wy_solve_tril_b64_f32(A, S)
 w48, u48 = gdn.gdn_wy_recompute_wu_b64_bf16(k16_l2, v48, beta, g_cumsum, Ai)
 h0, v_new = gdn.gdn_wy_chunk_h_b64_bf16(k16_l2, u48, w48, g_cumsum, state)

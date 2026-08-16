@@ -13,10 +13,36 @@ Correctness metrics:
 - `p99_abs`
 - cosine similarity
 
+## SM120 MMA WY KKT
+
+The additive `gdn_wy_kkt_b64_mma_bf16` source gate covers
+`S={63,64,657,2048,2049}` against the established scalar entry. Across the
+grid, max absolute error was at most `3.73e-8`, p99 relative error was at most
+`3.20e-6`, and every upper-triangular and out-of-range tail value was exactly
+zero. Two CUDA Graph replays were bit-identical.
+
+At S=2048 on RTX 5090, PyTorch `2.11.0+cu128`, the scalar entry measured
+`876.26 us` and the MMA entry `26.65 us`, a `32.88x` speedup. This comparison
+uses the same package, tensors, stream, output layout, warmup, and timing
+harness.
+
 The reference uses the same recurrent Gated DeltaNet math with FP32 internal
 accumulation and BF16 state/output casts. Split/gating helpers are checked
 against exact PyTorch tensor formulas. `gdn_chunk_from_conv_smem_bf16` and the
 WY pipeline are checked end-to-end against the same recurrent reference.
+
+## Speculative state stash
+
+The H32/H16 stash gate uses `S=8` and requires bit-exact equality against the
+plain native fused chunk for the full output and final in-place state. Stash
+rows `0,2,4,6,7` are independently compared with plain-kernel re-advances over
+prefix lengths `1,3,5,7,8`; every comparison is bit-exact. An undersized stash
+is rejected, and two CUDA Graph replays are bit-identical for output, final
+state, and the complete stash.
+
+On RTX 5090 with PyTorch `2.11.0+cu128`, the stash entry measured `58.02 us`
+at `S/Hv/Hk/D=8/32/16/128`. Four separate prefix re-advances measured
+`119.89 us`, so state selection replaces that work at `2.07x` lower latency.
 
 The v5 H32/H16 producer profile covers `S={1,4,64}`. The complete H32 WY
 profile covers `S={1,17,64,65,128,256}` and all 11 head-parameterized stages.

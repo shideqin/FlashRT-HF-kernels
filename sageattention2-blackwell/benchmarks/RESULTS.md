@@ -1,5 +1,77 @@
 # sageattention2-blackwell Benchmark Results
 
+## Native V-producer parity update
+
+RTX 5090, published `flashrt/sageattention2-blackwell@v1` artifact
+`b1bef1f5`, Torch 2.11/CUDA 12.8, 10 warmup and 50 measured iterations. The FP8-V path
+uses the FlashRT native two-stage V producer with caller-owned BF16 transpose
+workspace. The earlier direct strided V producer is retained only as a
+low-level compatibility op and is not used by the public FP8-V wrapper.
+
+| Workload | Sq/Sk | Hq/Hkv | SDPA us | Static FP8V PW us | Static FP8V PT us | PW vs SDPA | PW/PT cosine |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| qwen3 prefill | 1024/1024 | 32/8 | 96.508 | 63.608 | 69.746 | 1.51x | 0.999998/0.999392 |
+| qwen3 prefill | 4096/4096 | 32/8 | 840.246 | 388.349 | 459.311 | 2.16x | 0.999997/0.999359 |
+| video self-attn | 6144/6144 | 32/32 | 3102.310 | 1373.791 | 1680.066 | 2.26x | 0.999997/0.999193 |
+| video self-attn | 24576/24576 | 32/32 | 45861.597 | 18735.784 | 19711.908 | 2.45x | 0.999997/0.999217 |
+| video cross-attn | 6144/1024 | 32/32 | 547.931 | 281.617 | 404.131 | 1.95x | 0.999997/0.999220 |
+| video cross-attn | 24576/1024 | 32/32 | 2016.243 | 1011.889 | 1285.750 | 1.99x | 0.999997/0.999256 |
+
+Same-process direct FlashRT-native comparison used identical inputs and timing:
+
+| Workload | Packaged full us | FlashRT native full us | Ratio | Packaged/native cosine |
+|---|---:|---:|---:|---:|
+| video self-attn 6144 | 1344.192 | 1357.312 | 0.990x | 1.0000000 |
+| video self-attn 24576 | 18702.976 | 18568.512 | 1.007x | 1.0000000 |
+| video cross-attn 6144/1024 | 288.944 | 287.376 | 1.005x | 1.0000000 |
+| video cross-attn 24576/1024 | 1013.232 | 1018.752 | 0.995x | 1.0000000 |
+
+The final source parity gate runs independent Hub and native producer+core
+paths from the same BF16 inputs. At `S=6144` and `S=24576`, all Q/K INT8 bytes,
+V FP8 bytes, and Q/K/V scale values are exact. Complete self-attention and
+cross-attention outputs are bitwise identical (`max_abs=0`). Scoped
+`__fdividef` calls in the Hub producers match the native object's
+`--use_fast_math` reciprocal semantics without enabling fast math for the
+packaged attention core.
+
+## Per-thread and Q/K producer release gate
+
+RTX 5090, PyTorch 2.11 + CUDA 12.8, 5 warmup and 20 measured iterations.
+All rows use caller-owned buffers. `PW` is the existing per-warp Q/K contract;
+`PT` is the SageAttention-compatible per-thread contract. Attempted
+single-launch PW producers were rejected from the release surface because they
+were slower than the two independently tuned producers.
+
+| Workload | Sq/Sk | Hq/Hkv | SDPA us | Static FP8V PW us | Static FP8V PT us | PT vs SDPA | PW/PT cosine |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| qwen3 prefill | 1024/1024 | 32/8 | 96.701 | 74.666 | 82.221 | 1.18x | 0.999998/0.999393 |
+| qwen3 prefill | 4096/4096 | 32/8 | 838.680 | 422.886 | 497.157 | 1.69x | 0.999998/0.999360 |
+| video self-attn | 6144/6144 | 32/32 | 3092.154 | 1692.186 | 2021.234 | 1.53x | 0.999997/0.999191 |
+| video self-attn | 24576/24576 | 32/32 | 45854.745 | 19652.870 | 20790.935 | 2.21x | 0.999997/0.999216 |
+| video cross-attn | 6144/1024 | 32/32 | 549.734 | 327.395 | 449.054 | 1.22x | 0.999997/0.999218 |
+| video cross-attn | 24576/1024 | 32/32 | 1991.554 | 1041.955 | 1329.354 | 1.50x | 0.999997/0.999256 |
+
+Contract gates additionally require combined PW wrapper results to be bitwise
+equal to the legacy producers, PT INT8/scales to match the official grouping
+and rounding formula, partial Q tiles (`S=3600/5070`), causal GQA, F16V/FP8V,
+and bitwise CUDA Graph replay for both granularities.
+
+## PR #172 static-workspace source gate
+
+RTX 5090, PyTorch 2.11.0+cu128, 5 warmup and 20 measured iterations. The
+static F16V/FP8V paths use caller-owned workspaces; allocation is outside
+timing. This source gate supplements, rather than replaces, the published
+artifact table below.
+
+| Workload | Sq/Sk | Hq/Hkv | Mask | SDPA us | Core us | Static F16V us | Static FP8V us | FP8V vs SDPA | Core cosine | p99 abs |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| qwen3 prefill | 1024/1024 | 32/8 | causal | 96.790 | 67.766 | 84.123 | 73.882 | 1.31x | 0.999998 | 0.000244 |
+| qwen3 prefill | 4096/4096 | 32/8 | causal | 840.448 | 504.120 | 558.125 | 423.051 | 1.99x | 0.999998 | 0.000122 |
+| video self-attn | 6144/6144 | 32/32 | none | 3094.739 | 1836.022 | 2017.475 | 1691.712 | 1.83x | 0.999997 | 0.000031 |
+| video self-attn | 24576/24576 | 32/32 | none | 45859.775 | 27515.961 | 28280.414 | 19638.545 | 2.34x | 0.999997 | 0.000015 |
+| video cross-attn | 6144/1024 | 32/32 | none | 553.312 | 317.989 | 390.594 | 329.637 | 1.68x | 0.999997 | 0.000122 |
+| video cross-attn | 24576/1024 | 32/32 | none | 2019.397 | 1155.619 | 1390.835 | 1046.165 | 1.93x | 0.999997 | 0.000122 |
+
 Published-artifact benchmark:
 
 - GPU: NVIDIA GeForce RTX 5090

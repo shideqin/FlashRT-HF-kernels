@@ -6,9 +6,11 @@
 #include <mutex>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "numeric_conversion.cuh"
 #include "qattn/qk_int_sv_f8_core.cuh"
 #undef PACK_SIZE_QK
 #undef PACK_SIZE_V
@@ -31,13 +33,29 @@ constexpr int kWarpQ = 32;
 constexpr int kWarpK = 64;
 constexpr int kPack = 8;
 
-inline int div_up_int(int x, int y) {
+__host__ __device__ inline int div_up_int(int x, int y) {
   return (x + y - 1) / y;
 }
 
 __device__ __forceinline__ int8_t f32_to_i8_sat(float x) {
-  x = fminf(127.0f, fmaxf(-127.0f, nearbyintf(x)));
-  return static_cast<int8_t>(x);
+  int v = __float2int_rn(x);
+  v = max(-127, min(127, v));
+  return static_cast<int8_t>(v);
+}
+
+__device__ __forceinline__ int8_t f32_to_i8_sage(float x) {
+  const float rounded = x >= 0.0f ? x + 0.5f : x - 0.5f;
+  int v = __float2int_rz(rounded);
+  v = max(-127, min(127, v));
+  return static_cast<int8_t>(v);
+}
+
+__device__ __forceinline__ float warp_max(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, offset));
+  }
+  return value;
 }
 
 template <int BlockTokens>
@@ -87,7 +105,7 @@ __global__ void quant_int8_bf16_nhd_d128_kernel(
     scale[((long long)b * heads + h) * gridDim.x + block_id] = smem[0] * (1.0f / 127.0f);
   }
   if (pos < seqlen) {
-    const float inv_s = 127.0f / smem[0];
+    const float inv_s = __fdividef(127.0f, smem[0]);
     int8_t* dst =
         out + (((long long)b * seqlen + pos) * heads + h) * kHeadDim + d_pack * kPack;
     char4 lo = make_char4(
@@ -102,6 +120,109 @@ __global__ void quant_int8_bf16_nhd_d128_kernel(
         f32_to_i8_sat(vals[7] * inv_s));
     reinterpret_cast<char4*>(dst)[0] = lo;
     reinterpret_cast<char4*>(dst)[1] = hi;
+  }
+}
+
+// SageAttention per-thread contract: every Q warp tile has eight scales for
+// token strides of eight; every K warp tile has four scales for token pairs
+// repeated at stride eight.
+__global__ void quant_qk_per_thread_int8_bf16_nhd_d128_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    int8_t* __restrict__ q_out,
+    int8_t* __restrict__ k_out,
+    float* __restrict__ q_scale,
+    float* __restrict__ k_scale,
+    int q_len,
+    int k_len,
+    int q_heads,
+    int k_heads) {
+  const int tile = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const bool q_head_valid = h < q_heads;
+  const bool k_head_valid = h < k_heads;
+
+  if (warp < 16 && q_head_valid) {
+    const int half = warp >> 3;
+    const int group = warp & 7;
+    float amax = 1.0e-7f;
+#pragma unroll
+    for (int token_i = 0; token_i < 4; ++token_i) {
+      const int pos = tile * 64 + half * 32 + group + token_i * 8;
+#pragma unroll
+      for (int d_i = 0; d_i < 4; ++d_i) {
+        const int d = lane + d_i * 32;
+        if (pos < q_len) {
+          const float value = __bfloat162float(q[(((long long)b * q_len + pos) * q_heads + h) * kHeadDim + d]);
+          amax = fmaxf(amax, fabsf(value));
+        }
+      }
+    }
+    amax = warp_max(amax);
+    const int q_tiles = div_up_int(q_len, kWarpQ);
+    const int q_tile = tile * 2 + half;
+    if (lane == 0 && q_tile < q_tiles) {
+      q_scale[((long long)b * q_heads + h) * q_tiles * 8 + q_tile * 8 + group] =
+          amax * (1.0f / 127.0f) + 1.0e-7f;
+    }
+    const float inv = 1.0f / (amax * (1.0f / 127.0f) + 1.0e-7f);
+#pragma unroll
+    for (int token_i = 0; token_i < 4; ++token_i) {
+      const int pos = tile * 64 + half * 32 + group + token_i * 8;
+#pragma unroll
+      for (int d_i = 0; d_i < 4; ++d_i) {
+        const int d = lane + d_i * 32;
+        if (pos < q_len) {
+          const long long idx = (((long long)b * q_len + pos) * q_heads + h) * kHeadDim + d;
+          q_out[idx] = f32_to_i8_sage(__bfloat162float(q[idx]) * inv);
+        }
+      }
+    }
+  }
+
+  if (warp < 4 && k_head_valid) {
+    const int group = warp;
+    float amax = 1.0e-7f;
+#pragma unroll
+    for (int token_i = 0; token_i < 8; ++token_i) {
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const int pos = tile * 64 + token_i * 8 + group * 2 + pair;
+#pragma unroll
+        for (int d_i = 0; d_i < 4; ++d_i) {
+          const int d = lane + d_i * 32;
+          if (pos < k_len) {
+            const float value = __bfloat162float(k[(((long long)b * k_len + pos) * k_heads + h) * kHeadDim + d]);
+            amax = fmaxf(amax, fabsf(value));
+          }
+        }
+      }
+    }
+    amax = warp_max(amax);
+    const int k_tiles = div_up_int(k_len, kWarpK);
+    if (lane == 0 && tile < k_tiles) {
+      k_scale[((long long)b * k_heads + h) * k_tiles * 4 + tile * 4 + group] =
+          amax * (1.0f / 127.0f) + 1.0e-7f;
+    }
+    const float inv = 1.0f / (amax * (1.0f / 127.0f) + 1.0e-7f);
+#pragma unroll
+    for (int token_i = 0; token_i < 8; ++token_i) {
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const int pos = tile * 64 + token_i * 8 + group * 2 + pair;
+#pragma unroll
+        for (int d_i = 0; d_i < 4; ++d_i) {
+          const int d = lane + d_i * 32;
+          if (pos < k_len) {
+            const long long idx = (((long long)b * k_len + pos) * k_heads + h) * kHeadDim + d;
+            k_out[idx] = f32_to_i8_sage(__bfloat162float(k[idx]) * inv);
+          }
+        }
+      }
+    }
   }
 }
 
@@ -174,7 +295,7 @@ __global__ void v_bf16_to_fp8_tpp_d128_kernel(
   if (tid == 0) {
     scale[((long long)b * heads + h) * kHeadDim + d] = s;
   }
-  const float inv_s = 448.0f / fmaxf(amax, 1.0e-7f);
+  const float inv_s = __fdividef(448.0f, fmaxf(amax, 1.0e-7f));
   int8_t* out_base = out + (((long long)b * kHeadDim + d) * heads + h) * padded;
 
   for (int t0 = tid * kPack; t0 < padded; t0 += blockDim.x * kPack) {
@@ -191,14 +312,128 @@ __global__ void v_bf16_to_fp8_tpp_d128_kernel(
       }
       vals[i] = x;
     }
-    uint32_t fp8_pack[2];
-    floatx4_to_e4m3x4(fp8_pack, vals, vals + 2);
-    floatx4_to_e4m3x4(fp8_pack + 1, vals + 4, vals + 6);
-    *reinterpret_cast<uint2*>(out_base + t0) = *reinterpret_cast<uint2*>(fp8_pack);
+    __nv_fp8x4_e4m3 lo(make_float4(vals[0], vals[1], vals[2], vals[3]));
+    __nv_fp8x4_e4m3 hi(make_float4(vals[4], vals[5], vals[6], vals[7]));
+    reinterpret_cast<__nv_fp8x4_e4m3*>(out_base + t0)[0] = lo;
+    reinterpret_cast<__nv_fp8x4_e4m3*>(out_base + t0)[1] = hi;
   }
 }
 
-template <MaskMode Mask>
+__global__ void v_transpose_pad_permute_bf16_d128_kernel(
+    const __nv_bfloat16* __restrict__ v,
+    __nv_bfloat16* __restrict__ out,
+    int seqlen,
+    int heads) {
+  constexpr int kTile = 64;
+  constexpr int kThreadsPerToken = kHeadDim / kPack;
+  __shared__ __nv_bfloat16 sm_load[kTile][kHeadDim];
+  __shared__ __nv_bfloat16 sm_store[kHeadDim][kTile];
+
+  const int tile = blockIdx.x;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int token_lane = tid / kThreadsPerToken;
+  const int d_pack = tid - token_lane * kThreadsPerToken;
+  const int padded = div_up_int(seqlen, kTile) * kTile;
+  const int src_t = tile * kTile + token_lane;
+  const int perm_lane = ((token_lane / 16) * 16) +
+                        ((token_lane % 16) / 8) * 2 +
+                        (((token_lane % 16) / 2) % 4) * 4 +
+                        (token_lane % 2);
+
+  if (src_t < seqlen) {
+    const __nv_bfloat16* src =
+        v + (((long long)b * seqlen + src_t) * heads + h) * kHeadDim + d_pack * kPack;
+    *reinterpret_cast<uint4*>(&sm_load[perm_lane][d_pack * kPack]) =
+        *reinterpret_cast<const uint4*>(src);
+  } else {
+    *reinterpret_cast<uint4*>(&sm_load[perm_lane][d_pack * kPack]) =
+        make_uint4(0, 0, 0, 0);
+  }
+  __syncthreads();
+
+  const int row = tid & 63;
+  const int d_base = tid >> 6;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    sm_store[d_base + i * (kHeadDim / kPack)][row] =
+        sm_load[row][d_base + i * (kHeadDim / kPack)];
+  }
+  __syncthreads();
+
+  const int d_out = tid / (kTile / kPack);
+  const int seq_pack = tid - d_out * (kTile / kPack);
+  __nv_bfloat16* dst =
+      out + (((long long)b * kHeadDim + d_out) * heads + h) * padded +
+      tile * kTile + seq_pack * kPack;
+  *reinterpret_cast<uint4*>(dst) =
+      *reinterpret_cast<uint4*>(&sm_store[d_out][seq_pack * kPack]);
+}
+
+__global__ void v_tpp_quant_fp8_d128_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    int8_t* __restrict__ out,
+    float* __restrict__ scale,
+    int seqlen,
+    int heads) {
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  const int d = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int padded = div_up_int(seqlen, kCtaK) * kCtaK;
+  const __nv_bfloat16* src =
+      in + (((long long)b * kHeadDim + d) * heads + h) * padded;
+  int8_t* dst = out + (((long long)b * kHeadDim + d) * heads + h) * padded;
+
+  float max_v = -INFINITY;
+  float min_v = INFINITY;
+  for (int t = tid * kPack; t < padded; t += blockDim.x * kPack) {
+    __nv_bfloat16 values[kPack];
+    *reinterpret_cast<uint4*>(values) = *reinterpret_cast<const uint4*>(src + t);
+#pragma unroll
+    for (int i = 0; i < kPack; ++i) {
+      const float x = __bfloat162float(values[i]);
+      max_v = fmaxf(max_v, x);
+      min_v = fminf(min_v, x);
+    }
+  }
+  __shared__ float smem_max[256];
+  __shared__ float smem_min[256];
+  smem_max[tid] = max_v;
+  smem_min[tid] = min_v;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + stride]);
+      smem_min[tid] = fminf(smem_min[tid], smem_min[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float amax = fmaxf(fabsf(smem_max[0]), fabsf(smem_min[0]));
+  const float safe_amax = fmaxf(amax, 1.0e-7f);
+  if (tid == 0) {
+    scale[((long long)b * heads + h) * kHeadDim + d] = safe_amax * (1.0f / 448.0f);
+  }
+  // FlashRT's native Sage2 object is built with --use_fast_math. Match its
+  // reciprocal semantics locally without changing the packaged attention core.
+  const float inv_scale = __fdividef(448.0f, safe_amax);
+  for (int t = tid * kPack; t < padded; t += blockDim.x * kPack) {
+    __nv_bfloat16 values_bf16[kPack];
+    float values[kPack];
+    *reinterpret_cast<uint4*>(values_bf16) = *reinterpret_cast<const uint4*>(src + t);
+#pragma unroll
+    for (int i = 0; i < kPack; ++i) {
+      values[i] = __bfloat162float(values_bf16[i]) * inv_scale;
+    }
+    uint32_t fp8_pack[2];
+    floatx4_to_e4m3x4(fp8_pack, values, values + 2);
+    floatx4_to_e4m3x4(fp8_pack + 1, values + 4, values + 6);
+    *reinterpret_cast<uint2*>(dst + t) = *reinterpret_cast<uint2*>(fp8_pack);
+  }
+}
+
+template <MaskMode Mask, QuantGranularity Granularity>
 int launch_f16(
     const void* q_int8,
     const void* k_int8,
@@ -238,11 +473,11 @@ int launch_f16(
 
   using Kernel = decltype(&qk_int_sv_f16_attn_kernel<
       kCtaQ, kCtaK, kWarpQ, kWarpK, kHeadDim,
-      DataType::kInt8, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp,
+      DataType::kInt8, Granularity, Granularity,
       float, false, nv_bfloat16, ComputeUnit::kTensorCore, Mask, false, false>);
   Kernel kernel = qk_int_sv_f16_attn_kernel<
       kCtaQ, kCtaK, kWarpQ, kWarpK, kHeadDim,
-      DataType::kInt8, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp,
+      DataType::kInt8, Granularity, Granularity,
       float, false, nv_bfloat16, ComputeUnit::kTensorCore, Mask, false, false>;
 
   const size_t smem_qkv =
@@ -278,7 +513,7 @@ int launch_f16(
   return static_cast<int>(cudaGetLastError());
 }
 
-template <MaskMode Mask>
+template <MaskMode Mask, QuantGranularity Granularity>
 int launch_f8(
     const void* q_int8,
     const void* k_int8,
@@ -320,11 +555,11 @@ int launch_f8(
 
   using Kernel = decltype(&qk_int_sv_f8_attn_kernel<
       kCtaQ, kCtaK, kWarpQ, kWarpK, kHeadDim,
-      DataType::kInt8, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp,
+      DataType::kInt8, Granularity, Granularity,
       float, false, nv_bfloat16, ComputeUnit::kCudaCore, Mask, false, true, false>);
   Kernel kernel = qk_int_sv_f8_attn_kernel<
       kCtaQ, kCtaK, kWarpQ, kWarpK, kHeadDim,
-      DataType::kInt8, QuantGranularity::kPerWarp, QuantGranularity::kPerWarp,
+      DataType::kInt8, Granularity, Granularity,
       float, false, nv_bfloat16, ComputeUnit::kCudaCore, Mask, false, true, false>;
 
   const size_t smem_qkv = static_cast<size_t>(kCtaQ * kHeadDim + kCtaK * kHeadDim + kCtaK * kHeadDim);
@@ -370,6 +605,14 @@ int q_scale_elems(int batch, int seqlen_q, int num_q_heads) {
 
 int k_scale_elems(int batch, int seqlen_k, int num_kv_heads) {
   return batch * num_kv_heads * div_up_int(seqlen_k, kWarpK);
+}
+
+int q_thread_scale_elems(int batch, int seqlen_q, int num_q_heads) {
+  return q_scale_elems(batch, seqlen_q, num_q_heads) * 8;
+}
+
+int k_thread_scale_elems(int batch, int seqlen_k, int num_kv_heads) {
+  return k_scale_elems(batch, seqlen_k, num_kv_heads) * 4;
 }
 
 int v_scale_elems(int batch, int head_dim, int num_kv_heads) {
@@ -418,6 +661,25 @@ void quant_per_block_int8_bf16_d128(
       heads);
 }
 
+int quant_qk_per_thread_int8_bf16_d128(
+    const void* q_bf16, const void* k_bf16,
+    void* q_i8, void* k_i8, void* q_scale_f32, void* k_scale_f32,
+    int batch, int seqlen_q, int seqlen_k, int q_heads, int k_heads,
+    cudaStream_t stream) {
+  if (!q_bf16 || !k_bf16 || !q_i8 || !k_i8 || !q_scale_f32 || !k_scale_f32) return -1;
+  if (batch <= 0 || seqlen_q <= 0 || seqlen_k <= 0 || q_heads <= 0 || k_heads <= 0) return -2;
+  quant_qk_per_thread_int8_bf16_nhd_d128_kernel<<<
+      dim3(std::max(div_up_int(seqlen_q, kWarpK), div_up_int(seqlen_k, kWarpK)),
+           std::max(q_heads, k_heads), batch),
+      512, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_bf16),
+      reinterpret_cast<const __nv_bfloat16*>(k_bf16),
+      reinterpret_cast<int8_t*>(q_i8), reinterpret_cast<int8_t*>(k_i8),
+      reinterpret_cast<float*>(q_scale_f32), reinterpret_cast<float*>(k_scale_f32),
+      seqlen_q, seqlen_k, q_heads, k_heads);
+  return static_cast<int>(cudaGetLastError());
+}
+
 void v_bf16_to_fp16_d128(
     const void* v_bf16,
     void* v_half,
@@ -450,6 +712,26 @@ void v_bf16_to_fp8_tpp_d128(
       heads);
 }
 
+void v_bf16_to_fp8_tpp_native_d128(
+    const void* v_bf16,
+    void* v_tpp_bf16,
+    void* v_fp8,
+    void* v_scale,
+    int batch,
+    int seqlen,
+    int heads,
+    cudaStream_t stream) {
+  if (batch <= 0 || seqlen <= 0 || heads <= 0) return;
+  v_transpose_pad_permute_bf16_d128_kernel<<<
+      dim3(div_up_int(seqlen, kCtaK), heads, batch), 1024, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(v_bf16),
+      reinterpret_cast<__nv_bfloat16*>(v_tpp_bf16), seqlen, heads);
+  v_tpp_quant_fp8_d128_kernel<<<dim3(heads, batch, kHeadDim), 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(v_tpp_bf16),
+      reinterpret_cast<int8_t*>(v_fp8), reinterpret_cast<float*>(v_scale),
+      seqlen, heads);
+}
+
 int sage2_qk_int8_sv_f16_bf16_gqa_d128(
     const void* q_int8,
     const void* k_int8,
@@ -466,11 +748,11 @@ int sage2_qk_int8_sv_f16_bf16_gqa_d128(
     bool causal,
     cudaStream_t stream) {
   if (causal) {
-    return launch_f16<MaskMode::kCausal>(
+    return launch_f16<MaskMode::kCausal, QuantGranularity::kPerWarp>(
         q_int8, k_int8, v_half, out_bf16, q_scale, k_scale,
         batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
   }
-  return launch_f16<MaskMode::kNone>(
+  return launch_f16<MaskMode::kNone, QuantGranularity::kPerWarp>(
       q_int8, k_int8, v_half, out_bf16, q_scale, k_scale,
       batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
 }
@@ -492,11 +774,40 @@ int sage2_qk_int8_sv_f8_bf16_gqa_d128(
     bool causal,
     cudaStream_t stream) {
   if (causal) {
-    return launch_f8<MaskMode::kCausal>(
+    return launch_f8<MaskMode::kCausal, QuantGranularity::kPerWarp>(
         q_int8, k_int8, v_fp8, out_bf16, q_scale, k_scale, v_scale,
         batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
   }
-  return launch_f8<MaskMode::kNone>(
+  return launch_f8<MaskMode::kNone, QuantGranularity::kPerWarp>(
+      q_int8, k_int8, v_fp8, out_bf16, q_scale, k_scale, v_scale,
+      batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
+}
+
+int sage2_qk_int8_pt_sv_f16_bf16_gqa_d128(
+    const void* q_int8, const void* k_int8, const void* v_half, void* out_bf16,
+    const void* q_scale, const void* k_scale, int batch, int seqlen_q, int seqlen_k,
+    int num_q_heads, int num_kv_heads, float softmax_scale, bool causal, cudaStream_t stream) {
+  if (causal) {
+    return launch_f16<MaskMode::kCausal, QuantGranularity::kPerThread>(
+        q_int8, k_int8, v_half, out_bf16, q_scale, k_scale,
+        batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
+  }
+  return launch_f16<MaskMode::kNone, QuantGranularity::kPerThread>(
+      q_int8, k_int8, v_half, out_bf16, q_scale, k_scale,
+      batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
+}
+
+int sage2_qk_int8_pt_sv_f8_bf16_gqa_d128(
+    const void* q_int8, const void* k_int8, const void* v_fp8, void* out_bf16,
+    const void* q_scale, const void* k_scale, const void* v_scale,
+    int batch, int seqlen_q, int seqlen_k, int num_q_heads, int num_kv_heads,
+    float softmax_scale, bool causal, cudaStream_t stream) {
+  if (causal) {
+    return launch_f8<MaskMode::kCausal, QuantGranularity::kPerThread>(
+        q_int8, k_int8, v_fp8, out_bf16, q_scale, k_scale, v_scale,
+        batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
+  }
+  return launch_f8<MaskMode::kNone, QuantGranularity::kPerThread>(
       q_int8, k_int8, v_fp8, out_bf16, q_scale, k_scale, v_scale,
       batch, seqlen_q, seqlen_k, num_q_heads, num_kv_heads, softmax_scale, stream);
 }

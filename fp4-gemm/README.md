@@ -10,6 +10,7 @@ paths.
 ## Available Functions
 
 - `sfa_size_bytes(rows, dim)`
+- `capabilities()`
 - `quantize_fp4_sfa_fp16(x, packed=None, sfa=None, is_sfb=False)`
 - `quantize_fp4_sfa_bf16(x, packed=None, sfa=None, is_sfb=False)`
 - `quantize_fp4_sfa_mse_fp16(x, packed=None, sfa=None, is_sfb=False)`
@@ -34,6 +35,7 @@ paths.
 - `nvfp4_gemm_streamk_bf16(a_packed, b_packed, sfa, sfb, alpha=1.0, out=None)`
 - `nvfp4_gemm_streamk_bias_bf16(a_packed, b_packed, sfa, sfb, bias, alpha=1.0, out=None)`
 - `fp4_w4a16_linear_bf16(...)` is retained as a compatibility alias
+- `fp4_w4a4_gemm_warpsplit_mrows_bf16(a_packed, b_packed, sfa, sfb, ...)`
 - `e0m3_weight_gemm_fp16(a_packed, b_packed, sfa, sfb, alpha=1.0, a_format=1, out=None)`
 - `nvfp4_gemm_relu2_nvfp4(a_packed, b_packed, sfa, sfb, out_packed=None, out_sfa=None)`
 
@@ -49,6 +51,14 @@ paths.
 - `K` must be divisible by 16.
 - Targets: Blackwell `sm_110a` (Jetson AGX Thor, CUDA 13+) and `sm_120a`
   (RTX Blackwell, CUDA 12.8+).
+
+`capabilities()` is the artifact-owned source of truth for layouts, scale
+factor tiling and alignment. In particular, its scale buffer formula is
+`ceil(rows/128) * ceil((cols/16)/4) * 128 * 64` bytes. The public Tensor API
+accepts arbitrary positive `M`; individual raw CUTLASS tiles may internally
+use an `M=128` tile and must not be treated as the public shape contract.
+Unsupported shapes and CUTLASS `can_implement`/initialize/run failures raise a
+PyTorch exception. They never print and continue with undefined output.
 
 `variant` selects the CUTLASS schedule:
 
@@ -159,6 +169,22 @@ Use the bias/GELU and residual variants to avoid returning to BF16
 elementwise code between low-bit GEMMs. Stream-K variants are selected only
 for the validated large down-projection shapes; unsupported shapes reject
 rather than silently selecting a losing schedule.
+
+For M=1 decode, call `fp4_repack_b_interleaved_sm120` once when binding a
+static packed weight, then use `fp4_w4a4_gemv_warpsplit_interleaved_bf16` in
+the hot path. The default 8-warp/3-stage schedule is the qualified
+out-of-cache profile; explicit `warps` and `stages` remain available for
+shape-specific tuning.
+
+`nvfp4_gemm_m256_bf16` is an explicit SM120 large-M tier. Query
+`nvfp4_gemm_m256_workspace_size` and allocate the workspace before graph
+capture. Runtime dispatchers must read `capabilities()`; M>=512 alone is not
+a performance qualification for every N/K pair.
+
+`fp4_w4a4_gemm_warpsplit_mrows_bf16` is the SM120 speculative-verify tier.
+It serves `M=1..16` with the standard packed weight and scale layout, so it
+does not require the duplicate interleaved weight used by the M=1 decode
+tier. Read the exact alignment and row range from `capabilities()`.
 
 ## Validation
 
